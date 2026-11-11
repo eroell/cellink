@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy as _copy
 import logging
+import tempfile
 from collections.abc import Callable
+from pathlib import Path
 
 import dask.array as da
 import h5py
@@ -96,12 +98,13 @@ class DonorData:
     """Store and manage donor-related data with single-cell readouts.
 
     This class allows donor-level, especially genetic, analysis with single-cell datasets.
-    It holds AnnData objects for donor-level/genetic (G) and single-cell (C) data
+    It holds AnnData objects for donor-level/genetic (G) and single-cell (C) data.
+    G can also be an :class:`~ehrdata.EHRData` with a time axis (e.g. repeated clinical measurements).
 
     Attributes
     ----------
-        G (AnnData): Donor-level AnnData
-        C (AnnData): Cell-level AnnData
+        G (AnnData | EHRData | MuData): Donor-level data
+        C (AnnData | MuData): Cell-level AnnData
         donor_id (str): Key for donor information in C.obs
 
     Returns
@@ -182,6 +185,8 @@ class DonorData:
             if isinstance(modality, MuData):
                 group = f.create_group(key)
                 _write_h5mu(group, modality)
+            elif _is_ehrdata(modality):
+                _write_ehrdata(f, key, modality, zarr_path)
             elif is_zarr and hasattr(modality.X, "ndim") and not sp.issparse(modality.X):
                 key_chunks = x_chunks.get(key) if isinstance(x_chunks, dict) else x_chunks
                 _write_anndata_zarr_dense_x_chunked(f, key, modality, zarr_path, chunks=key_chunks)
@@ -229,7 +234,7 @@ class DonorData:
             given: a dask-backed `X` keeps its own existing chunks (via
             `dask.array.to_zarr`); a plain array gets chunks capped at 4096
             per axis. Only applies to a dense `X`; sparse/`MuData` are
-            unaffected.
+            unaffected, and so is an EHRData `G`, which ehrdata writes itself.
 
         Example
         -------
@@ -238,7 +243,11 @@ class DonorData:
         for m in [self.G, self.C]:
             if isinstance(m, MuData):
                 raise NotImplementedError("MuData not supported for zarr write")
-        f = zarr.open(path, mode="w")
+        if _is_ehrdata(self.G):
+            # ehrdata writes a Zarr v3 group, which a v2 root store (zarr's default_zarr_format=2) can't hold
+            f = zarr.open_group(path, mode="w", zarr_format=3)
+        else:
+            f = zarr.open(path, mode="w")
         self._write_dd(f, zarr_path=str(path), x_chunks=x_chunks)
 
     def _ensure_extension(self, path: str, ext: str) -> str:
@@ -461,8 +470,8 @@ class DonorData:
     def prep_repr(self) -> str:
         """String representation of DonorData showing side-by-side dd.G and dd.C views."""
         # Split the representations into lines
-        G_lines, G_highlight = _anndata_repr(self.G, self.G.n_obs, self.G.n_vars, self._var_dims_to_sync)
-        C_lines, C_highlight = _anndata_repr(self.C, self.C.n_obs, self.C.n_vars, [self.donor_id])
+        G_lines, G_highlight = _anndata_repr(self.G, self._var_dims_to_sync)
+        C_lines, C_highlight = _anndata_repr(self.C, [self.donor_id])
 
         def pad_lists(l1, l2):
             max_lines = max(len(l1), len(l2))
@@ -528,21 +537,65 @@ class DonorData:
         )
 
     @property
-    def shape(self) -> tuple[tuple[int, int], tuple[int, int]]:
-        return *self.G.shape, *self.C.shape
+    def shape(self) -> tuple[int, int, int, int]:
+        """``(n_donors, n_G_vars, n_cells, n_C_vars)``, the four axes ``dd[...]`` indexes.
+
+        A time axis of an EHRData ``G`` is not part of it, see ``dd.G.n_t``.
+        """
+        return self.G.n_obs, self.G.n_vars, self.C.n_obs, self.C.n_vars
 
 
-def _anndata_repr(adata, n_obs, n_vars, highlight_keys=None) -> str:
-    if adata.isbacked:
-        backed_at = f" backed at {str(adata.filename)!r}"
-    else:
-        backed_at = ""
-    lines = [[f"AnnData object with n_obs × n_vars = {n_obs:,} × {n_vars:,} {backed_at}"]]
+def _is_ehrdata(obj) -> bool:
+    """Whether ``obj`` is an :class:`~ehrdata.EHRData`, without importing ehrdata."""
+    return any(cls.__name__ == "EHRData" for cls in type(obj).__mro__) and hasattr(obj, "n_t")
+
+
+# An EHRData G is stored with ehrdata's own writers, so G/ holds exactly what ehrdata writes to a .h5ed file or a
+# .zarr store (and can be read by ehrdata). They only take paths, not a group of a larger file: for Zarr, G/ is a
+# subdirectory of the store and gets its own path; for HDF5, it goes through a temporary .h5ed file.
+# Writing and reading an EHRData G as part of the DonorData was inspired by the sibling donordata package
+# (https://github.com/theislab/donordata).
+
+
+def _write_ehrdata(f: h5py.File | zarr.Group, key: str, edata, zarr_path: str | None) -> None:
+    """Write ``edata`` to group ``key`` with ehrdata's writers.
+
+    As ``ehrdata.io.write_h5ed`` does, HDF5 stores string columns of ``obs``/``var`` with repeated values as
+    categoricals; Zarr keeps them as they are (``ehrdata.io.write_zarr``'s conversion would also change
+    ``edata.tem`` in place).
+    """
+    import ehrdata as ed
+
+    if isinstance(f, zarr.Group):
+        ed.io.write_zarr(edata, f"{zarr_path}/{key}", convert_strings_to_categoricals=False)
+        return
+    # next to the target file: G is copied once more, and the system temp dir may be small
+    with tempfile.TemporaryDirectory(dir=Path(f.filename).parent) as tmp:
+        tmp_file = Path(tmp) / f"{key}.h5ed"
+        ed.io.write_h5ed(edata, tmp_file)
+        with h5py.File(tmp_file, "r") as src:
+            group = f.create_group(key)
+            for name in src:
+                src.copy(src[name], group, name)
+            group.attrs.update(src.attrs)
+
+
+def _anndata_repr(adata, highlight_keys=()) -> tuple[list[list[str]], list[list[bool]]]:
+    backed_at = f" backed at {str(adata.filename)!r}" if getattr(adata, "isbacked", False) else ""
+    dims, sizes = "n_obs × n_vars", f"{adata.n_obs:,} × {adata.n_vars:,}"
+    attrs = ["obs", "var", "uns", "obsm", "varm", "layers", "obsp", "varp"]
+    if _is_ehrdata(adata):
+        dims, sizes = dims + " × n_t", sizes + f" × {adata.n_t:,}"
+        attrs.insert(2, "tem")
+    lines = [[f"{type(adata).__name__} object with {dims} = {sizes}{backed_at}"]]
     if adata.is_view:
         lines[0][0] = "View of " + lines[0][0]
     highlight = [[False]]
-    for attr in ["obs", "var", "uns", "obsm", "varm", "layers", "obsp", "varp"]:
-        keys = getattr(adata, attr).keys()
+    for attr in attrs:
+        mapping = getattr(adata, attr, None)
+        if mapping is None:  # e.g. MuData has no layers
+            continue
+        keys = mapping.keys()
 
         if len(keys) > 0:
             line = [f"    {attr}: "]

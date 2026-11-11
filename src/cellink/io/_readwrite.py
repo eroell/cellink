@@ -1,4 +1,6 @@
+import tempfile
 import warnings
+from pathlib import Path
 
 import h5py
 import zarr
@@ -79,6 +81,29 @@ def _read_mudata(group: StorageType, backed: bool = True) -> MuData:
     return mu
 
 
+def _read_ehrdata(group: StorageType):
+    """Read an EHRData G with ehrdata's own readers, the counterpart of ``DonorData``'s ``_write_ehrdata``.
+
+    ``read_zarr`` takes the group directly, ``read_h5ed`` only a path, so for HDF5 the group goes through a
+    temporary .h5ed file in the system temp dir (``TMPDIR``). Read as stored: no harmonizing of missing values
+    or casting of variables to float.
+    """
+    try:
+        import ehrdata as ed
+    except ImportError as e:
+        raise ImportError(f"{group.name} holds an EHRData, install ehrdata to read it.") from e
+    kwargs = {"harmonize_missing_values": False, "cast_variables_to_float": False}
+    if isinstance(group, zarr.Group):
+        return ed.io.read_zarr(group, **kwargs)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_file = Path(tmp) / "G.h5ed"
+        with h5py.File(tmp_file, "w") as dst:
+            for name in group:
+                group.copy(group[name], dst, name)
+            dst.attrs.update(group.attrs)
+        return ed.io.read_h5ed(tmp_file, **kwargs)
+
+
 def _read_dd(f: h5py.File, lazy: bool = False) -> DonorData:
     """
     Internal function to read a DonorData object from an HDF5 or Zarr group.
@@ -129,7 +154,9 @@ def _read_dd(f: h5py.File, lazy: bool = False) -> DonorData:
             stacklevel=2,
         )
 
-    if f["G"].attrs.get("encoding-type") == "MuData":
+    if "tem" in f["G"]:  # ehrdata's time annotation, which no AnnData or MuData group has
+        G = _read_ehrdata(f["G"])
+    elif f["G"].attrs.get("encoding-type") == "MuData":
         G = _read_mudata(group=f["G"])
     elif f["G"].attrs.get("encoding-type") == "anndata":
         G = _read_anndata(f["G"])
@@ -186,7 +213,8 @@ def read_zarr_dd(path: str) -> DonorData:
     `G` and `C` are read lazily: a dense `X` stays Dask-backed rather than
     being materialized on load, so a caller can select a subset (e.g. one
     cell type via ``dd.sel(C_obs=...)``) and only that subset is ever read
-    off disk once it's actually computed/materialized.
+    off disk once it's actually computed/materialized. An EHRData `G` is
+    read into memory by ehrdata.
 
     Parameters
     ----------

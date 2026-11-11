@@ -1,10 +1,12 @@
 from pathlib import Path
 
 import mudata as md
+import numpy as np
+import pandas as pd
 import pytest
 
 from cellink._core.data_fields import CAnn, DAnn
-from cellink._core.donordata import DonorData
+from cellink._core.donordata import DonorData, _anndata_repr
 
 if hasattr(md, "set_options"):
     md.set_options(pull_on_update=False)  # mudata <0.4
@@ -214,6 +216,99 @@ def test_write_zarr_dd(tmp_path, adata, gdata):
     dd.write_zarr_dd(str(output_path))
 
     assert output_path.exists()
+
+
+@pytest.fixture
+def ehr_gdata(adata):
+    ed = pytest.importorskip("ehrdata")
+    donors = adata.obs[DAnn.donor].unique()
+    n_donors, n_vars, n_t = len(donors), 2, 3
+    return ed.EHRData(
+        layers={"tem_data": np.arange(n_donors * n_vars * n_t, dtype=float).reshape(n_donors, n_vars, n_t)},
+        obs=pd.DataFrame({DAnn.donor: donors}, index=pd.Index(donors, name=DAnn.donor)),
+        var=pd.DataFrame(index=["BP_Systolic", "BP_Diastolic"]),
+        tem=pd.DataFrame({"visit_id": ["V1", "V2", "V3"]}, index=["1", "2", "3"]),
+    )
+
+
+def test_ehrdata_G(adata, ehr_gdata):
+    dd = DonorData(G=ehr_gdata, C=adata)
+    n_donors, n_vars, n_t = ehr_gdata.shape
+
+    # the time axis is not one of the four axes dd[...] indexes
+    assert dd.shape == (n_donors, n_vars, *adata.shape)
+    assert str(dd) == (
+        f"DonorData(n_G_obs={n_donors:,}, n_G_vars={n_vars:,}, n_C_obs={adata.n_obs:,}, n_C_vars={adata.n_vars:,})"
+    )
+    lines, _ = _anndata_repr(dd.G)
+    assert lines[0] == [f"EHRData object with n_obs × n_vars × n_t = {n_donors} × {n_vars} × {n_t}"]
+    assert ["    tem: ", "'visit_id'"] in lines
+    assert "EHRData object" in repr(dd)
+
+    sub = dd[["D0", "D1"], :, :, :5].copy()
+    assert type(sub.G).__name__ == "EHRData"
+    assert sub.G.shape == (2, n_vars, n_t)
+    assert sub.shape[3] == 5
+
+
+@pytest.mark.parametrize("ext", [".dd.h5", ".dd.zarr"])
+def test_ehrdata_G_write_read(adata, ehr_gdata, tmp_path, ext):
+    from cellink.io import read_dd
+
+    ehr_gdata.layers["baseline"] = np.ones((ehr_gdata.n_obs, ehr_gdata.n_vars))  # a 2D layer next to the 3D one
+    ehr_gdata.uns["source"] = "clinic"
+    dd = DonorData(G=ehr_gdata, C=adata)
+    dd.aggregate(key_added="PB", sync_var=False)  # obsm DataFrame on the EHRData
+
+    path = tmp_path / f"ehr{ext}"
+    dd.write_dd(str(path))
+    dd2 = read_dd(str(path))
+
+    assert type(dd2.G).__name__ == "EHRData"
+    assert dd2.G.shape == dd.G.shape
+    assert dd2.shape == dd.shape
+    np.testing.assert_array_equal(np.asarray(dd2.G.layers["tem_data"]), np.asarray(dd.G.layers["tem_data"]))
+    np.testing.assert_array_equal(np.asarray(dd2.G.layers["baseline"]), dd.G.layers["baseline"])
+    pd.testing.assert_frame_equal(dd2.G.tem, dd.G.tem)
+    pd.testing.assert_frame_equal(dd2.G.obs, dd.G.obs)
+    pd.testing.assert_frame_equal(dd2.G.obsm["PB"], dd.G.obsm["PB"], check_dtype=False, check_names=False)
+    assert not any(k.startswith("_ed_ondisk") for k in dd2.G.obsm)
+    assert dd2.G.uns["source"] == "clinic"
+
+
+
+def test_ehrdata_G_write_read_strings(adata, ehr_gdata, tmp_path):
+    from cellink.io import read_dd
+
+    ehr_gdata.obs["sex"] = ["M", "F"] * (ehr_gdata.n_obs // 2) + ["M"] * (ehr_gdata.n_obs % 2)
+    ehr_gdata.tem["kind"] = ["visit", "visit", "follow-up"]
+    dd = DonorData(G=ehr_gdata, C=adata)
+    for ext in (".dd.h5", ".dd.zarr"):
+        path = tmp_path / f"strings{ext}"
+        dd.write_dd(str(path))
+        dd2 = read_dd(str(path))
+        # values survive; HDF5 stores repeated obs/var strings as categoricals, as ehrdata.io.write_h5ed does
+        assert dd2.G.obs["sex"].astype(str).tolist() == dd.G.obs["sex"].tolist()
+        assert dd2.G.tem["kind"].astype(str).tolist() == dd.G.tem["kind"].tolist()
+    # writing does not touch the in-memory object
+    assert dd.G.obs["sex"].dtype == object
+    assert dd.G.tem["kind"].dtype == object
+
+
+def test_ehrdata_G_write_zarr_v2_default(adata, ehr_gdata, tmp_path):
+    import zarr
+
+    from cellink.io import read_dd
+
+    dd = DonorData(G=ehr_gdata, C=adata)
+    path = tmp_path / "v2default.dd.zarr"
+    with zarr.config.set({"default_zarr_format": 2}):
+        dd.write_dd(str(path))
+    assert type(read_dd(str(path)).G).__name__ == "EHRData"
+
+
+def test_mudata_G_repr(adata, gdata):
+    assert "MuData object" in repr(DonorData(G=md.MuData({"genotype": gdata}), C=adata))
 
 
 if __name__ == "__main__":
